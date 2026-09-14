@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vibe Coding daemon: global push-to-talk audio capture for macOS."""
+"""Vibe Coding daemon: global hotkey toggle audio capture for macOS."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import queue
 import signal
 import sys
 import threading
+import time
 from enum import Enum
 from typing import Optional, Set
 
@@ -24,6 +25,8 @@ SAMPLE_RATE = 16_000
 CHANNELS = 1
 DTYPE = "float32"
 BLOCKSIZE = 1024
+MAX_RECORD_SECONDS = 60
+DEBOUNCE_SECONDS = 0.5
 
 # Command + Shift + Space
 HOTKEY: Set[Key] = {Key.cmd, Key.shift, Key.space}
@@ -61,11 +64,17 @@ class StateManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._state = State.IDLE
+        self._last_change = 0.0  # time.monotonic(); 0 means never changed
 
     @property
     def current(self) -> State:
         with self._lock:
             return self._state
+
+    @property
+    def last_change(self) -> float:
+        with self._lock:
+            return self._last_change
 
     def transition(self, from_state: State, to_state: State) -> bool:
         """Atomically move from_state -> to_state. Returns False if the current state mismatches."""
@@ -74,6 +83,7 @@ class StateManager:
                 return False
             logger.info("State: %s -> %s", from_state.value, to_state.value)
             self._state = to_state
+            self._last_change = time.monotonic()
             return True
 
 
@@ -173,6 +183,8 @@ def send_to_antigravity(audio_numpy_array: np.ndarray) -> None:
         audio_numpy_array.dtype,
     )
     logger.info("[Mock] Sending to Antigravity IDE...")
+    max_volume = np.max(np.abs(audio_numpy_array))
+    logger.info("Max volume level: %.4f", max_volume)
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +192,7 @@ def send_to_antigravity(audio_numpy_array: np.ndarray) -> None:
 # ---------------------------------------------------------------------------
 
 class VibeDaemon:
-    """Push-to-talk daemon: hold Cmd+Shift+Space to record, release to process."""
+    """Toggle daemon: press Cmd+Shift+Space to start or stop recording."""
 
     def __init__(self) -> None:
         self._state = StateManager()
@@ -190,6 +202,8 @@ class VibeDaemon:
         self._listener: Optional[keyboard.Listener] = None
         self._stop_event = threading.Event()
         self._process_thread: Optional[threading.Thread] = None
+        self._record_timer: Optional[threading.Timer] = None
+        self._timer_lock = threading.Lock()
 
     @staticmethod
     def _normalize(key: object) -> object:
@@ -197,27 +211,41 @@ class VibeDaemon:
             return _MODIFIER_ALIASES[key]
         return key
 
-    def _hotkey_held(self) -> bool:
-        with self._pressed_lock:
-            return HOTKEY.issubset(self._pressed)
-
     def _on_press(self, key: object) -> None:
         if self._stop_event.is_set():
             return
         normalized = self._normalize(key)
         with self._pressed_lock:
+            already_complete = self._pressed == HOTKEY
             self._pressed.add(normalized)
-            held = HOTKEY.issubset(self._pressed)
-        if held:
-            self._begin_recording()
+            now_complete = self._pressed == HOTKEY
+        # Rising edge only: fire once when the combo becomes an exact match.
+        if now_complete and not already_complete:
+            self._on_hotkey()
 
     def _on_release(self, key: object) -> None:
+        # Track key-up so the next press can form a fresh exact match.
+        # Never change state here — avoids macOS key-repeat alert sounds.
         normalized = self._normalize(key)
         with self._pressed_lock:
             self._pressed.discard(normalized)
-            held = HOTKEY.issubset(self._pressed)
-        if not held:
-            self._end_recording()
+
+    def _on_hotkey(self) -> None:
+        elapsed = time.monotonic() - self._state.last_change
+        if elapsed < DEBOUNCE_SECONDS:
+            logger.info("Hotkey debounced (%.2fs < %.2fs)", elapsed, DEBOUNCE_SECONDS)
+            return
+
+        state = self._state.current
+        if state == State.IDLE:
+            # 建立背景執行緒來啟動硬體，避免阻塞鍵盤中斷
+            threading.Thread(target=self._begin_recording, daemon=True).start()
+        elif state == State.RECORDING:
+            logger.info("Hotkey toggle: stopping recording")
+            # 同樣將停止動作交給背景執行緒
+            threading.Thread(target=self._end_recording, daemon=True).start()
+        else:
+            logger.info("Hotkey ignored while state is %s", state.value)
 
     def _begin_recording(self) -> None:
         if not self._state.transition(State.IDLE, State.RECORDING):
@@ -227,8 +255,11 @@ class VibeDaemon:
         except Exception:
             logger.exception("Failed to start audio capture")
             self._state.transition(State.RECORDING, State.IDLE)
+            return
+        self._arm_record_timer()
 
     def _end_recording(self) -> None:
+        self._cancel_record_timer()
         if not self._state.transition(State.RECORDING, State.PROCESSING):
             return
         try:
@@ -245,6 +276,33 @@ class VibeDaemon:
         )
         self._process_thread.start()
 
+    def _arm_record_timer(self) -> None:
+        self._cancel_record_timer()
+        timer = threading.Timer(MAX_RECORD_SECONDS, self._on_record_timeout)
+        timer.daemon = True
+        with self._timer_lock:
+            self._record_timer = timer
+            timer.start()
+        logger.info("Recording fail-safe armed (%ds)", MAX_RECORD_SECONDS)
+
+    def _cancel_record_timer(self) -> None:
+        with self._timer_lock:
+            timer = self._record_timer
+            self._record_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _on_record_timeout(self) -> None:
+        if self._stop_event.is_set():
+            return
+        if self._state.current != State.RECORDING:
+            return
+        logger.warning(
+            "Max recording time (%ds) reached; auto-stopping",
+            MAX_RECORD_SECONDS,
+        )
+        self._end_recording()
+
     def _process(self, audio: np.ndarray) -> None:
         try:
             if audio.size == 0:
@@ -258,7 +316,8 @@ class VibeDaemon:
 
     def run(self) -> None:
         logger.info(
-            "Vibe daemon starting. Hold Cmd+Shift+Space to talk. Ctrl+C to quit."
+            "Vibe daemon starting. Press Cmd+Shift+Space to start/stop recording. "
+            "Ctrl+C to quit."
         )
         logger.info(
             "macOS: grant Accessibility (for the hotkey) and Microphone permission."
@@ -279,10 +338,12 @@ class VibeDaemon:
             self.shutdown()
 
     def shutdown(self) -> None:
-        if self._stop_event.is_set():
+        if self._stop_event.is_set() and self._listener is None:
             return
         self._stop_event.set()
         logger.info("Shutting down...")
+
+        self._cancel_record_timer()
 
         if self._listener is not None:
             self._listener.stop()
