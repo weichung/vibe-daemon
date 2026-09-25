@@ -13,6 +13,9 @@ from core.engine import State, VibeDaemon
 
 logger = logging.getLogger("vibe-daemon")
 
+EN_VOICE = None
+ZH_VOICE = "Meijia"
+
 _STATE_UI = {
     State.IDLE: ("🟢 Idle", "Status: 🟢 Idle", "Idle"),
     State.RECORDING: ("🔴 Recording", "Status: 🔴 Recording", "Recording"),
@@ -48,10 +51,23 @@ def _get_vu_meter(volume: float) -> str:
 def _speak(text: str) -> None:
     if not text:
         return
-    if re.search(r"[\u4e00-\u9fff]", text):
-        subprocess.Popen(["say", "-v", "Ting-Ting", text])
-    else:
-        subprocess.Popen(["say", "-v", "Samantha", text])
+
+    def _run() -> None:
+        if re.search(r"[\u4e00-\u9fff]", text):
+            cmd = ["say", "-v", ZH_VOICE, text]
+        elif EN_VOICE:
+            cmd = ["say", "-v", EN_VOICE, text]
+        else:
+            cmd = ["say", text]
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        if completed.returncode != 0:
+            logger.error(
+                "TTS failed (exit %s): %s",
+                completed.returncode,
+                (completed.stderr or completed.stdout or "").strip(),
+            )
+
+    threading.Thread(target=_run, name="vibe-tts", daemon=True).start()
 
 
 class VibeMenuBarApp(rumps.App):
