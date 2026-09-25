@@ -12,7 +12,7 @@ from google.genai import types
 
 logger = logging.getLogger("vibe-daemon")
 
-ROUTER_MODEL = "gemini-2.0-flash"
+ROUTER_MODEL = "gemini-3.8-flash"
 ROUTER_SYSTEM_INSTRUCTION = (
     "You are a macOS system router. Listen to the audio and call the "
     "appropriate tool. For coding, extract the instruction. For OS tasks, "
