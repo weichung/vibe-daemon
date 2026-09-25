@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import threading
 
@@ -45,8 +46,12 @@ def _get_vu_meter(volume: float) -> str:
 
 
 def _speak(text: str) -> None:
-    if text:
-        subprocess.Popen(["say", text])
+    if not text:
+        return
+    if re.search(r"[\u4e00-\u9fff]", text):
+        subprocess.Popen(["say", "-v", "Ting-Ting", text])
+    else:
+        subprocess.Popen(["say", "-v", "Samantha", text])
 
 
 class VibeMenuBarApp(rumps.App):

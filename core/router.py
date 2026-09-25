@@ -17,7 +17,9 @@ ROUTER_SYSTEM_INSTRUCTION = (
     "You are a macOS system router. Listen to the audio and call the "
     "appropriate tool. For coding, extract the instruction. For OS tasks, "
     "write the correct bash/zsh command. For general chat, provide a concise "
-    "response."
+    "response. Always reply to conversational queries in the exact same "
+    "language that the user spoke (e.g., reply in Traditional Chinese if the "
+    "user spoke Chinese, and English if the user spoke English)."
 )
 
 OnRouteToIde = Callable[[bytes], None]
