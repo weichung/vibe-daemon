@@ -1,3 +1,60 @@
+# Bytecode and caches
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+virtualenv/
+
+# Packaging / PyInstaller
+build/
+dist/
+*.egg
+*.egg-info/
+*.spec
+pip-wheel-metadata/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+.vibe_daemon_env
+*.pem
+*.key
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Audio / numpy dumps from local testing
 *.wav
 *.npy
+*.npz
+
+# Logs and local temp
+*.log
+*.tmp
+.cache/

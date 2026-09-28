@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import queue
 import subprocess
 import threading
@@ -201,10 +202,12 @@ class VibeDaemon:
         on_state_change: Optional[OnStateChange] = None,
         on_tts_ready: Optional[OnText] = None,
         on_transcript_ready: Optional[OnText] = None,
+        on_setup_required: Optional[Callable[[], None]] = None,
     ) -> None:
         self._on_state_change = on_state_change
         self._on_tts_ready = on_tts_ready
         self._on_transcript_ready = on_transcript_ready
+        self._on_setup_required = on_setup_required
         self._state = StateManager()
         self._recorder = AudioRecorder()
         self._pressed: Set[object] = set()
@@ -294,6 +297,13 @@ class VibeDaemon:
             self._pressed.discard(normalized)
 
     def _on_hotkey(self) -> None:
+        if not os.environ.get("GEMINI_API_KEY"):
+            logger.warning("Hotkey pressed but no API key set.")
+            self._emit_tts("Please set your API key.")
+            if self._on_setup_required:
+                self._on_setup_required()
+            return
+
         elapsed = time.monotonic() - self._state.last_change
         if elapsed < DEBOUNCE_SECONDS:
             logger.info("Hotkey debounced (%.2fs < %.2fs)", elapsed, DEBOUNCE_SECONDS)

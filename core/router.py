@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from collections.abc import Callable
 from typing import Optional
@@ -30,11 +31,28 @@ class VibeRouter:
     """Gemini function-calling router over captured microphone audio."""
 
     def __init__(self) -> None:
-        self.client = genai.Client()
+        self.client = None
         self.on_route_to_ide: Optional[OnRouteToIde] = None
         self.on_shell_executed: Optional[OnText] = None
         self.on_conversation: Optional[OnText] = None
         self._pending_wav_bytes: bytes = b""
+        if os.environ.get("GEMINI_API_KEY"):
+            try:
+                self.client = genai.Client()
+            except Exception as e:
+                logger.error("Failed to initialize Gemini client: %s", e)
+
+    def reload_client(self) -> None:
+        """Rebuild the Gemini client after GEMINI_API_KEY changes."""
+        self.client = None
+        if os.environ.get("GEMINI_API_KEY"):
+            try:
+                self.client = genai.Client()
+                logger.info("Gemini client reloaded")
+            except Exception as e:
+                logger.error("Failed to initialize Gemini client: %s", e)
+        else:
+            logger.warning("GEMINI_API_KEY missing; Gemini client not initialized")
 
     def _tool_route_to_ide(self, instruction: str) -> str:
         """Route a coding or file-editing request to the Antigravity IDE.
@@ -96,6 +114,8 @@ class VibeRouter:
 
     def dispatch_audio(self, wav_bytes: bytes) -> str:
         """Classify spoken audio and execute the matching tool. Returns a summary."""
+        if not self.client:
+            return "API key is missing. Please set it in Preferences."
         self._pending_wav_bytes = wav_bytes
         audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
         try:

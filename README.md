@@ -3,141 +3,185 @@
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-macOS-black?logo=apple)
 ![Arch](https://img.shields.io/badge/arch-Apple%20Silicon-lightgrey)
-![License](https://img.shields.io/badge/license-private-inactive)
+![Model](https://img.shields.io/badge/Gemini-3.8%20Flash-4285F4?logo=google&logoColor=white)
+![Status](https://img.shields.io/badge/status-feature--complete-success)
 
-An OS-level voice coding assistant for macOS. Hold a global hotkey, speak an instruction, and let an agent act on your workspace — with a live menu-bar status, git safety nets, and spoken summaries so you never have to look at the screen.
+A secure, OS-level **voice coding assistant** and **intent-routing agent** for macOS. Speak a command; the daemon classifies it with **Gemini 3.8 Flash** and routes it to the IDE, the shell, or a short conversation — without hardcoded secrets, and without taking your eyes off the work.
 
 ## Overview
 
-**vibe-daemon** is a lightweight background agent for “vibe coding.” It sits in the macOS menu bar, listens for **Cmd+Shift+Space**, records from the system microphone, and hands the audio to the [Google Antigravity](https://antigravity.google) IDE SDK for code changes.
+**vibe-daemon** lives in the macOS menu bar. Press **Cmd+Shift+Space**, talk, and press the hotkey again. Audio is captured at 16 kHz mono, checkpointed in git, then classified by Gemini function calling:
 
-The loop is deliberately simple:
+| Intent | Destination |
+| --- | --- |
+| Write or edit code | [Google Antigravity](https://antigravity.google) IDE SDK |
+| OS / filesystem / apps | Local shell (`bash` / `zsh`) |
+| General questions | Spoken conversational reply (same language as the user) |
 
-1. Toggle recording with a global hotkey.
-2. Checkpoint the git working tree.
-3. Send 16 kHz mono audio to the Antigravity agent.
-4. Speak a short summary back while the full transcript stays in the menu.
+The engine never stores API keys in source. Keys live in `~/.vibe_daemon_env` and are edited through an isolated tkinter Preferences process that can steal focus and accept native Cmd+V.
 
-Core logic is platform-agnostic. macOS-only pieces (menu bar, `say`, Accessibility) live behind a thin adapter so Windows and Linux can follow later.
+## Core features
 
-## Features
+### Intelligent routing
 
-- **Menu bar UI** (`rumps`) — 🟢 Idle, 🔴 Recording with a real-time VU meter, 🟡 Processing. The dropdown shows the latest transcript and agent action.
-- **Hands-free capture** — Global hotkey via `pynput`; async microphone I/O via `sounddevice`.
-- **Safety first** — Before every agent call, the daemon runs `git add .` and `git commit -m "vibe-checkpoint: pre-agent action"` so you can roll back.
-- **Dual-track feedback** — Timestamped INFO logs in the terminal; concise TTS via macOS `say` for eyes-free coding.
-- **Modular architecture** — `core/` owns state, audio, parsing, and routing; `platforms/` owns UI and OS integrations.
+`core/router.py` sends the WAV clip to **Gemini 3.8 Flash** with three tools. Automatic function calling is disabled; the daemon parses `function_calls` and runs the matching Python method:
+
+- **IDE** — coding / file edits → Antigravity agent (`<tts>` summary + `<transcript>`)
+- **Shell** — OS tasks → `subprocess` with stdout/stderr spoken and shown in the menu
+- **Conversation** — Q&A → bilingual TTS, matching the spoken language
+
+### Secure GUI dashboard
+
+Zero hardcoded keys. On first launch (or **Preferences…**), an isolated `tkinter` process opens **Vibe Daemon Preferences**:
+
+- Masked Gemini API Key field
+- Max recording duration
+- Enable TTS checkbox
+- Writes `~/.vibe_daemon_env` via `python-dotenv` (`chmod 600`)
+- Forced to the foreground (System Events + `-topmost`)
+- Explicit Cmd+V / Cmd+C / Cmd+A bindings so paste works outside an `.app` bundle
+
+### Graceful fallback
+
+If `GEMINI_API_KEY` is missing, the daemon does **not** crash:
+
+- Gemini client stays `None`; `dispatch_audio` returns a Preferences reminder
+- Hotkey intercepts: TTS *“Please set your API key.”* and auto-launches the dashboard
+- Canceling setup only logs a warning; recording stays idle until a key is saved
+
+### Bilingual TTS
+
+Menu-bar TTS runs on a background thread (`subprocess.run`, not the rumps main loop). CJK (`\u4e00–\u9fff`) uses macOS **Meijia**; otherwise the system English voice. Failures log `stderr` instead of failing silently.
+
+### Live menu bar
+
+`rumps` owns the main thread:
+
+| Title | Meaning |
+| --- | --- |
+| 🟢 | Idle |
+| 🔴 ▂▃▅▆▇ | Recording + live VU meter |
+| 🟡 | Processing |
+
+The dropdown shows status, last transcript, and last action. **Preferences…** and **Quit** are first-class items.
+
+### Safety net
+
+Before every routed action, the engine runs:
+
+```bash
+git add .
+git commit -m "vibe-checkpoint: pre-agent action"
+```
+
+Empty commits fail quietly (`capture_output=True`). Roll back with normal git history.
 
 ## Architecture
 
 ```
 vibe-daemon/
-├── run_mac.py                 # macOS entry point
-├── daemon.py                  # thin alias for run_mac.py
+├── run_mac.py                      # Entry: engine thread + rumps main loop
+├── daemon.py                       # Alias → run_mac.py
 ├── core/
-│   ├── engine.py              # state machine, hotkey, capture, agent handoff
-│   ├── parser.py              # <tts> / <transcript> extraction
-│   └── router.py              # intent classification (in progress)
+│   ├── engine.py                   # State machine, hotkey, capture, git, callbacks
+│   ├── router.py                   # Gemini 3.8 Flash function calling
+│   └── parser.py                   # <tts> / <transcript> extraction
 └── platforms/
     └── macos/
-        └── menu_app.py        # rumps menu bar + say() TTS
+        ├── menu_app.py             # Menu bar, VU meter, bilingual say()
+        └── prefs_ui.py             # Isolated tkinter Preferences process
 ```
 
-| Path | Role |
+| Module | Responsibility |
 | --- | --- |
-| `run_mac.py` | Starts `VibeDaemon` on a background thread, then blocks the main thread on the `rumps` app. |
-| `core/engine.py` | Thread-safe `IDLE → RECORDING → PROCESSING` machine, push-to-toggle hotkey, `AudioRecorder`, git checkpoint, Antigravity send. |
-| `core/parser.py` | Pulls a speakable summary from `<tts>` tags and recognized speech from `<transcript>` tags. |
-| `platforms/macos/menu_app.py` | Menu-bar title, VU meter, dropdown dashboard, and macOS TTS. Talks to the engine only through callbacks. |
+| `run_mac.py` | `threading.Thread(target=engine.run, daemon=True)` then `rumps.App.run()` on the main thread. |
+| `core/engine.py` | `IDLE → RECORDING → PROCESSING`, Cmd+Shift+Space toggle, `AudioRecorder`, git checkpoint, `on_setup_required` intercept. |
+| `core/router.py` | `genai.Client` (safe init), `dispatch_audio(wav_bytes)`, tools for IDE / shell / chat. |
+| `platforms/macos/menu_app.py` | Callbacks only: TTS, menu titles, launches `prefs_ui.py` as a child process. |
+| `platforms/macos/prefs_ui.py` | Standalone tkinter UI in its **own process** so rumps / LSUIElement cannot steal or bury the window. |
 
-The engine never calls `say` or touches AppKit. Platform code never owns the recorder. That split is the contract for future `platforms/windows` and `platforms/linux` adapters.
-
-## Prerequisites
-
-### System
-
-- macOS on Apple Silicon
-- Python **3.10+**
-- [Antigravity IDE](https://antigravity.google) installed and open (the SDK talks to a local harness)
-- A git repository as the working directory (checkpoints are commits)
-
-### macOS permissions
-
-Grant these to the **Terminal** (or the Python binary) that launches the daemon:
-
-| Permission | Why |
-| --- | --- |
-| **Accessibility** | Global `Cmd+Shift+Space` listener (`pynput`) |
-| **Microphone** | `sounddevice` capture |
-
-System Settings → Privacy & Security → Accessibility / Microphone.
-
-### Python dependencies
-
-```bash
-pip install rumps sounddevice pynput numpy google-antigravity
-```
-
-| Package | Used for |
-| --- | --- |
-| `rumps` | Menu bar app (main thread) |
-| `sounddevice` | Async microphone stream |
-| `pynput` | Global hotkey |
-| `numpy` | Audio buffers |
-| `google-antigravity` | Agent SDK (`google.antigravity`) |
+The engine never calls `say` or Tk. The Preferences GUI never imports the recorder. That split is the contract for a future Windows/Linux tray.
 
 ## Installation
 
+### System
+
+- macOS (Apple Silicon recommended)
+- [Miniconda](https://docs.conda.io/en/latest/miniconda.html) or Anaconda
+- [Antigravity IDE](https://antigravity.google) installed and **open** for coding routes
+- Working directory should be a git repo (checkpoints are commits)
+
+### macOS permissions
+
+Grant these to the Terminal / conda Python that launches the daemon:
+
+| Permission | Why |
+| --- | --- |
+| **Accessibility** | Global hotkey (`pynput`) |
+| **Microphone** | Capture (`sounddevice`) |
+
+System Settings → Privacy & Security → Accessibility / Microphone.
+
+### Conda environment
+
 ```bash
-git clone <repo-url> vibe-daemon
+git clone https://github.com/<you>/vibe-daemon.git
 cd vibe-daemon
-python3 -m venv .venv
-source .venv/bin/activate
-pip install rumps sounddevice pynput numpy google-antigravity
+
+conda create -n vibe-daemon python=3.11 -y
+conda activate vibe-daemon
+
+pip install \
+  rumps \
+  google-genai \
+  python-dotenv \
+  pynput \
+  sounddevice \
+  numpy \
+  google-antigravity
 ```
 
-Run from the git repo you want the agent to edit — checkpoints and the Antigravity workspace both use the current working directory.
+`tkinter` ships with the conda Python.org / official macOS builds. If `import tkinter` fails: `conda install tk`.
+
+| Package | Role |
+| --- | --- |
+| `rumps` | Menu bar (main thread) |
+| `google-genai` | Gemini 3.8 Flash router |
+| `python-dotenv` | `~/.vibe_daemon_env` |
+| `pynput` | Global hotkey |
+| `sounddevice` | Microphone stream |
+| `numpy` | Audio buffers |
+| `google-antigravity` | IDE agent SDK |
 
 ## Usage
 
 ```bash
-python run_mac.py
+conda activate vibe-daemon
+cd /path/to/your/project    # git repo the agent should edit
+python /path/to/vibe-daemon/run_mac.py
 ```
 
-(`python daemon.py` is equivalent.)
+On first run, Preferences opens if no key is stored. Paste a [Gemini API key](https://aistudio.google.com/apikey), save, then:
 
-A 🟢 indicator appears in the menu bar.
-
-| Action | What happens |
+| Action | Result |
 | --- | --- |
-| Press **Cmd+Shift+Space** | Idle → Recording. Title becomes a live 🔴 VU meter. `say Recording`. |
-| Press **Cmd+Shift+Space** again | Recording → Processing. Stream stops, git checkpoint runs, audio is sent to Antigravity. `say Processing`. |
-| Agent finishes | Menu shows transcript + last action. TTS reads the `<tts>` summary. State returns to 🟢 Idle. |
-| 120 s without a stop | Fail-safe stops recording and processes whatever was captured. |
-| **Quit** in the menu | Engine shutdown, then the app exits. |
+| **Cmd+Shift+Space** | Start recording (🔴 VU meter) |
+| **Cmd+Shift+Space** again | Stop, checkpoint, route audio |
+| No key | TTS warning + Preferences window; no crash |
+| **Preferences…** | Edit key, max record, TTS enable; client reloads in place |
+| 120 s silence | Auto-stop fail-safe (override in Preferences) |
+| **Quit** | Engine shutdown |
 
-Hotkey presses within 0.5 s of a state change are ignored so key-repeat cannot double-toggle.
+Hotkey debounce is 0.5 s. Conversational replies follow the user’s language (English or Traditional Chinese).
 
-Keep the Antigravity IDE open. If the local harness is down, the daemon logs a connection error and returns to Idle without crashing.
-
-## Configuration (defaults)
-
-| Constant | Value | Meaning |
-| --- | --- | --- |
-| Hotkey | `Cmd+Shift+Space` | Exact-match rising edge |
-| Sample rate | 16 kHz mono float32 | Speech capture |
-| Max record | 120 s | Auto-stop fail-safe |
-| Debounce | 0.5 s | Ignore rapid retriggers |
-| Checkpoint message | `vibe-checkpoint: pre-agent action` | Git commit before the agent |
+Secrets stay in `~/.vibe_daemon_env` — never commit that file.
 
 ## Roadmap
 
-**Intent routing (coming soon).** A Gemini Flash function-calling layer will sit in front of the IDE: spoken audio is classified, then dispatched to Antigravity (code), a local shell (OS tasks), or a short conversational reply. Scaffolding lives in `core/router.py`.
-
-**Windows and Linux.** The engine is already callback-driven. Next up: tray/status adapters under `platforms/windows` and `platforms/linux`, plus a TTS backend that is not `say`.
-
-**Preferences.** The menu item is a placeholder for hotkey, mic device, and max-record settings.
+- **PyInstaller `.app` + GitHub Actions** — signed menu-bar bundle, CI install/test/release, no Terminal required.
+- **Vision & screen capture** — multimodal context (screenshot + voice) for UI bugs and design diffs.
+- **Multi-turn agentic loops** — background tool cycles for long-running web / repo tasks without a second hotkey press.
 
 ## License
 
-Private / unpublished. All rights reserved unless a license file is added to this repository.
+MIT — see [`LICENSE`](LICENSE) once published. Until then, all rights reserved.

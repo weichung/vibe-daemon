@@ -1,0 +1,10 @@
+# Runtime dependencies for `python run_mac.py` (macOS).
+# tkinter ships with CPython / conda; if missing: `conda install tk`
+
+rumps
+google-genai
+python-dotenv
+pynput
+sounddevice
+numpy
+google-antigravity

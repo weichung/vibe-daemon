@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
+import pathlib
 import re
 import subprocess
+import sys
 import threading
 
 import rumps
+from dotenv import load_dotenv
 
 from core.engine import State, VibeDaemon
 
@@ -15,6 +19,7 @@ logger = logging.getLogger("vibe-daemon")
 
 EN_VOICE = None
 ZH_VOICE = "Meijia"
+ENV_FILE = pathlib.Path.home() / ".vibe_daemon_env"
 
 _STATE_UI = {
     State.IDLE: ("🟢 Idle", "Status: 🟢 Idle", "Idle"),
@@ -101,10 +106,12 @@ class VibeMenuBarApp(rumps.App):
             self.quit_item,
         ]
 
+        self._ensure_api_key()
         self.engine = VibeDaemon(
             on_state_change=self._on_state_change,
             on_tts_ready=self._on_tts_ready,
             on_transcript_ready=self._on_transcript_ready,
+            on_setup_required=self._launch_preferences_ui,
         )
 
     def _on_state_change(self, new_state: State) -> None:
@@ -142,11 +149,47 @@ class VibeMenuBarApp(rumps.App):
         self.transcript_item.title = f"Transcript: {_clip(transcript)}"
         self.action_item.title = f"Last action: {_clip(action)}"
 
-    def _on_preferences(self, _sender) -> None:  # noqa: ARG002
-        rumps.alert(
-            title="Preferences",
-            message="Preferences are not implemented yet.",
+    def _ensure_env_file(self) -> None:
+        ENV_FILE.touch(exist_ok=True)
+        try:
+            ENV_FILE.chmod(0o600)
+        except OSError:
+            logger.warning("Could not restrict permissions on %s", ENV_FILE)
+
+    def _launch_preferences_ui(self) -> None:
+        script = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "platforms"
+            / "macos"
+            / "prefs_ui.py"
         )
+        subprocess.run([sys.executable, str(script)], check=False)
+        load_dotenv(ENV_FILE, override=True)
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            engine.router.reload_client()
+
+    def _ensure_api_key(self) -> None:
+        self._ensure_env_file()
+        load_dotenv(ENV_FILE)
+        if os.environ.get("GEMINI_API_KEY"):
+            logger.info("Loaded GEMINI_API_KEY from %s", ENV_FILE)
+            return
+        self._launch_preferences_ui()
+        load_dotenv(ENV_FILE, override=True)
+        if os.environ.get("GEMINI_API_KEY"):
+            logger.info("GEMINI_API_KEY saved from Preferences")
+            return
+        logger.warning(
+            "No GEMINI_API_KEY set. The router will fail until a key is saved "
+            "in Preferences."
+        )
+
+    def _on_preferences(self, _sender) -> None:  # noqa: ARG002
+        self._launch_preferences_ui()
+        load_dotenv(ENV_FILE, override=True)
+        self.engine.router.reload_client()
+        logger.info("Preferences closed; Gemini client reloaded")
 
     def _on_quit(self, _sender) -> None:  # noqa: ARG002
         logger.info("Quit selected from menu bar")
