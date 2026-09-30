@@ -6,7 +6,7 @@
 ![Model](https://img.shields.io/badge/Gemini-3.8%20Flash-4285F4?logo=google&logoColor=white)
 ![Status](https://img.shields.io/badge/status-feature--complete-success)
 
-A secure, OS-level **voice coding assistant** and **intent-routing agent** for macOS. Speak a command; the daemon classifies it with **Gemini 3.8 Flash** and routes it to the IDE, the shell, or a short conversation — without hardcoded secrets, and without taking your eyes off the work.
+A secure, OS-level **voice coding assistant** and **intent-routing agent** for macOS. Speak a command, drop a Markdown task, or POST to a local webhook; the daemon classifies it with **Gemini 3.8 Flash** and routes it to the IDE, the shell, or a short conversation — without hardcoded secrets, and without taking your eyes off the work.
 
 ## Overview
 
@@ -32,15 +32,15 @@ The engine never stores API keys in source. Keys live in `~/.vibe_daemon_env` an
 
 ### Local Webhook API
 
-Vibe Daemon is primarily voice-driven, but at startup the engine also spawns a lightweight **Flask** HTTP server on port **50051** in a background daemon thread (`core/api_server.py`).
+At startup the engine spawns a background **Flask** server bound to **`127.0.0.1:50051`** (`core/api_server.py`). External Python scripts, web scrapers, and agentic loops can **bypass the microphone** and inject text commands straight into the same Gemini intent router used for speech (`dispatch_text`).
 
-That local webhook is the bridge for **external automation**: Python scripts, web scrapers, and multi-turn agentic loops can skip the microphone entirely and inject a text command straight into the same Gemini intent router used for speech (`dispatch_text`). The payload is classified as IDE / shell / conversation exactly as if you had spoken it.
+The payload is classified as IDE / shell / conversation exactly as if you had spoken it — no hotkey, no WAV, no TTS round-trip required.
 
 - **URL:** `POST http://127.0.0.1:50051/execute` (localhost only)
 - **Body:** `{"text": "<command>"}`
 - **Success:** `{"status": "success", "result": "<router summary>"}`
 
-The daemon must already be running (`python run_mac.py`). A missing API key returns the usual Preferences reminder in `result` instead of crashing.
+The daemon must already be running (`python run_mac.py`). A missing API key returns the usual Preferences reminder in `result` instead of crashing. Sample webhook clients live in `tests/` (`test_01_single_shot.py`, `test_02_pipeline.py`, `test_03_batch_agent.py`).
 
 **Python (`requests`):**
 
@@ -59,6 +59,20 @@ curl -X POST http://127.0.0.1:50051/execute \
      -H "Content-Type: application/json" \
      -d '{"text": "Summarize the latest logs in my terminal."}'
 ```
+
+### Markdown TODO watcher
+
+An asynchronous daemon thread (`core/todo_watcher.py`) polls **`~/Documents/VibeTasks.md`** every 3 seconds. Unfinished Markdown tasks (`- [ ] …`) are picked up, sent through Gemini via `dispatch_text`, and marked **`- [x]`** when they finish.
+
+Race-condition protection is strict: after a long-running task completes, the watcher **re-reads the file from disk**, finds the **exact** unfinished line, replaces **only that line**, then writes back and refreshes `mtime`. User edits (added, deleted, or rewritten lines) made while the AI was working are never overwritten by a stale in-memory buffer. The watcher also updates `mtime` immediately after its own save so it cannot loop on itself.
+
+Open the list from the menu bar: **📝 Open TODO List**. If the file does not exist, a starter template is created first.
+
+### Robust VAD (voice activity detection)
+
+Before any Gemini or Antigravity call, `core/engine.py` runs **local RMS energy thresholding** on the captured buffer (`SILENCE_THRESHOLD = 0.005`). Near-silent clips are dropped with a spoken *“I didn't hear anything.”*
+
+That filter cuts background-noise hallucinations (empty-room “transcripts”) and **avoids wasting API calls** on non-speech. The threshold is tuned so normal conversational speech is not clipped.
 
 ### Secure GUI dashboard
 
@@ -93,7 +107,7 @@ Menu-bar TTS runs on a background thread (`subprocess.run`, not the rumps main l
 | 🔴 ▂▃▅▆▇ | Recording + live VU meter |
 | 🟡 | Processing |
 
-The dropdown shows status, last transcript, and last action. **Preferences…** and **Quit** are first-class items.
+The dropdown shows status, last transcript, and last action. **Preferences…**, **📝 Open TODO List**, and **Quit** are first-class items.
 
 ### Safety net
 
@@ -106,6 +120,12 @@ git commit -m "vibe-checkpoint: pre-agent action"
 
 Empty commits fail quietly (`capture_output=True`). Roll back with normal git history.
 
+## Recent fixes
+
+- **Preferences Cmd+V double-paste** — macOS Tkinter was bubbling the native paste *and* the bound `<<Paste>>` handler, inserting the clipboard twice. Paste is now a single insert (`clipboard_get`) that returns `"break"` so the event does not propagate.
+- **Recording-timeout deadlock** — the state machine used to end recording on the `threading.Timer` thread, which could lock against rumps / hotkey callbacks. Timeouts now hop to a dedicated `daemon=True` worker that calls `_end_recording`.
+- **Silence threshold** — RMS VAD was too aggressive (`0.02`) and clipped quiet but real speech. The floor is now `0.005`, which still rejects room noise without cutting off a normal speaking voice.
+
 ## Architecture
 
 ```
@@ -113,9 +133,12 @@ vibe-daemon/
 ├── run_mac.py                      # Entry: engine thread + rumps main loop
 ├── daemon.py                       # Alias → run_mac.py
 ├── core/
-│   ├── engine.py                   # State machine, hotkey, capture, git, callbacks
+│   ├── engine.py                   # State machine, hotkey, VAD, git, callbacks
 │   ├── router.py                   # Gemini 3.8 Flash function calling
+│   ├── api_server.py               # Flask webhook on 127.0.0.1:50051
+│   ├── todo_watcher.py             # ~/Documents/VibeTasks.md poller
 │   └── parser.py                   # <tts> / <transcript> extraction
+├── tests/                          # Webhook / pipeline sample clients
 └── platforms/
     └── macos/
         ├── menu_app.py             # Menu bar, VU meter, bilingual say()
@@ -125,9 +148,11 @@ vibe-daemon/
 | Module | Responsibility |
 | --- | --- |
 | `run_mac.py` | `threading.Thread(target=engine.run, daemon=True)` then `rumps.App.run()` on the main thread. |
-| `core/engine.py` | `IDLE → RECORDING → PROCESSING`, Cmd+Shift+Space toggle, `AudioRecorder`, git checkpoint, `on_setup_required` intercept. |
-| `core/router.py` | `genai.Client` (safe init), `dispatch_audio(wav_bytes)`, tools for IDE / shell / chat. |
-| `platforms/macos/menu_app.py` | Callbacks only: TTS, menu titles, launches `prefs_ui.py` as a child process. |
+| `core/engine.py` | `IDLE → RECORDING → PROCESSING`, Cmd+Shift+Space toggle, RMS VAD, git checkpoint, webhook + TODO watcher threads. |
+| `core/router.py` | `genai.Client` (safe init), `dispatch_audio` / `dispatch_text`, tools for IDE / shell / chat. |
+| `core/api_server.py` | Local Flask `POST /execute` for microphone-free injection. |
+| `core/todo_watcher.py` | Poll `VibeTasks.md`, dispatch unfinished tasks, mark done with a disk re-read. |
+| `platforms/macos/menu_app.py` | Callbacks only: TTS, menu titles, Open TODO List, launches `prefs_ui.py` as a child process. |
 | `platforms/macos/prefs_ui.py` | Standalone tkinter UI in its **own process** so rumps / LSUIElement cannot steal or bury the window. |
 
 The engine never calls `say` or Tk. The Preferences GUI never imports the recorder. That split is the contract for a future Windows/Linux tray.
@@ -201,7 +226,9 @@ On first run, Preferences opens if no key is stored. Paste a [Gemini API key](ht
 | **Cmd+Shift+Space** again | Stop, checkpoint, route audio |
 | No key | TTS warning + Preferences window; no crash |
 | **Preferences…** | Edit key, max record, TTS enable; client reloads in place |
-| 120 s silence | Auto-stop fail-safe (override in Preferences) |
+| **📝 Open TODO List** | Open `~/Documents/VibeTasks.md` (create template if missing) |
+| Near-silent clip | Local VAD drops the buffer; no Gemini call |
+| 120 s timeout | Auto-stop fail-safe on a worker thread (override in Preferences) |
 | **Quit** | Engine shutdown |
 
 Hotkey debounce is 0.5 s. Conversational replies follow the user’s language (English or Traditional Chinese).
@@ -212,9 +239,18 @@ Secrets stay in `~/.vibe_daemon_env` — never commit that file.
 
 ## Roadmap
 
+### Phase 2: Autonomous multi-turn agent (ReAct loop)
+
+Upgrade `core/router.py` from **single-shot** tool calls to a **stateful, multi-turn reasoning loop**. The agent should observe results, plan the next step, and continue until the goal is met — including tasks with sequential dependencies (search → read → edit → verify) that one Gemini turn cannot finish safely.
+
+### Expanded agentic pipelines
+
+Build dedicated external Python scripts that talk to the **Local Webhook API** (`127.0.0.1:50051`) to automate daily workflows without the microphone: download harvesters, log summarizers, and code reviewers that POST text commands into the same Gemini router the hotkey uses.
+
+### Later
+
 - **PyInstaller `.app` + GitHub Actions** — signed menu-bar bundle, CI install/test/release, no Terminal required.
 - **Vision & screen capture** — multimodal context (screenshot + voice) for UI bugs and design diffs.
-- **Multi-turn agentic loops** — background tool cycles for long-running web / repo tasks without a second hotkey press.
 
 ## License
 
