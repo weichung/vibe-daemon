@@ -9,3 +9,4 @@ sounddevice
 numpy
 google-antigravity
 flask
+requests

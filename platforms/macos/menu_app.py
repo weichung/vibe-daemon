@@ -95,6 +95,10 @@ class VibeMenuBarApp(rumps.App):
             "Preferences...",
             callback=self._on_preferences,
         )
+        self.todo_item = rumps.MenuItem(
+            "📝 Open TODO List",
+            callback=self._on_open_todo_list,
+        )
         self.quit_item = rumps.MenuItem("Quit", callback=self._on_quit)
 
         self.menu = [
@@ -103,6 +107,7 @@ class VibeMenuBarApp(rumps.App):
             self.action_item,
             None,
             self.preferences_item,
+            self.todo_item,
             self.quit_item,
         ]
 
@@ -190,6 +195,17 @@ class VibeMenuBarApp(rumps.App):
         load_dotenv(ENV_FILE, override=True)
         self.engine.router.reload_client()
         logger.info("Preferences closed; Gemini client reloaded")
+
+    def _on_open_todo_list(self, _sender) -> None:  # noqa: ARG002
+        path = os.path.expanduser("~/Documents/VibeTasks.md")
+        if not os.path.isfile(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# Vibe Daemon Tasks\n\n- [ ] Summarize my recent downloads\n"
+                )
+            logger.info("Created TODO list template at %s", path)
+        subprocess.run(["open", path], check=False)
 
     def _on_quit(self, _sender) -> None:  # noqa: ARG002
         logger.info("Quit selected from menu bar")

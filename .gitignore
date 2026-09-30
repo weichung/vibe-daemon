@@ -58,3 +58,4 @@ pip-wheel-metadata/
 *.log
 *.tmp
 .cache/
+tests/output.txt

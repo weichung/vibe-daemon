@@ -24,6 +24,7 @@ from pynput.keyboard import Key
 from core.api_server import start_server
 from core.parser import _extract_transcript, _extract_tts_summary
 from core.router import VibeRouter
+from core.todo_watcher import TodoWatcher
 
 SAMPLE_RATE = 16_000
 CHANNELS = 1
@@ -31,6 +32,9 @@ DTYPE = "float32"
 BLOCKSIZE = 1024
 MAX_RECORD_SECONDS = 120
 DEBOUNCE_SECONDS = 0.5
+# RMS floor for float32 [-1, 1]. Typical room noise is well below this;
+# spoken voice is usually 0.05–0.25 RMS.
+SILENCE_THRESHOLD = 0.005
 
 HOTKEY: Set[Key] = {Key.cmd, Key.shift, Key.space}
 
@@ -195,6 +199,26 @@ def _float32_mono_to_wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+def _audio_rms(samples: np.ndarray) -> float:
+    """Root-mean-square amplitude of a 1-D float audio buffer."""
+    flat = np.asarray(samples, dtype=np.float64).reshape(-1)
+    if flat.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(flat))))
+
+
+def _is_silence(samples: np.ndarray, threshold: float = SILENCE_THRESHOLD) -> bool:
+    rms = _audio_rms(samples)
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    logger.info(
+        "Audio energy: rms=%.4f peak=%.4f threshold=%.4f",
+        rms,
+        peak,
+        threshold,
+    )
+    return rms < threshold
+
+
 class VibeDaemon:
     """Toggle daemon: press Cmd+Shift+Space to start or stop recording."""
 
@@ -223,6 +247,12 @@ class VibeDaemon:
         self.router.on_shell_executed = self._on_router_text
         self.router.on_conversation = self._on_router_text
         threading.Thread(target=start_server, args=(self.router,), daemon=True).start()
+        self.todo_watcher = TodoWatcher(self.router)
+        threading.Thread(
+            target=self.todo_watcher.poll,
+            name="vibe-todo-watcher",
+            daemon=True,
+        ).start()
 
     def _on_route_to_ide(self, audio_bytes: bytes) -> None:
         """Forward routed coding audio to the existing Antigravity pipeline."""
@@ -374,12 +404,13 @@ class VibeDaemon:
             "Max recording time (%ds) reached; auto-stopping",
             MAX_RECORD_SECONDS,
         )
-        self._end_recording()
+        threading.Thread(target=self._end_recording, daemon=True).start()
 
     def _process(self, audio: np.ndarray) -> None:
         try:
-            if audio.size == 0:
-                logger.warning("No audio captured; skipping agent send")
+            if audio.size == 0 or _is_silence(audio):
+                logger.info("Audio too quiet, aborting route")
+                self._emit_tts("I didn't hear anything.")
             else:
                 subprocess.run(["git", "add", "."], capture_output=True)
                 subprocess.run(
