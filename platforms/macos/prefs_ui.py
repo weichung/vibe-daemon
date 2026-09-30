@@ -29,19 +29,6 @@ class PreferencesApp:
         self.root = root
         self.root.title("Vibe Daemon Preferences")
         self.root.resizable(False, False)
-        def _handle_paste(event):
-            self.root.focus_get().event_generate("<<Paste>>")
-            return "break"
-
-        self.root.bind("<Command-v>", _handle_paste)
-        self.root.bind(
-            "<Command-c>",
-            lambda e: self.root.focus_get().event_generate("<<Copy>>"),
-        )
-        self.root.bind(
-            "<Command-a>",
-            lambda e: self.root.focus_get().event_generate("<<SelectAll>>"),
-        )
 
         # Force macOS to bring this specific Python process to the front
         os.system(
@@ -75,9 +62,10 @@ class PreferencesApp:
         self.max_record_var = tk.StringVar(
             value=os.environ.get("MAX_RECORD_SECONDS", "120")
         )
-        ttk.Entry(frame, textvariable=self.max_record_var, width=12).grid(
-            row=3, column=0, sticky="w", pady=(0, 12)
+        self.max_record_entry = ttk.Entry(
+            frame, textvariable=self.max_record_var, width=12
         )
+        self.max_record_entry.grid(row=3, column=0, sticky="w", pady=(0, 12))
 
         self.enable_tts_var = tk.BooleanVar(value=_env_bool("ENABLE_TTS", True))
         ttk.Checkbutton(
@@ -91,7 +79,65 @@ class PreferencesApp:
         )
 
         self.root.bind("<Return>", lambda _event: self._save())
+        self._bind_clipboard_shortcuts()
         self.api_key_entry.focus_force()
+
+    def _focused_entry(self) -> tk.Widget | None:
+        widget = self.root.focus_get()
+        if widget is None or not hasattr(widget, "insert"):
+            return self.api_key_entry
+        return widget
+
+    def _on_paste(self, _event: tk.Event | None = None) -> str:
+        widget = self._focused_entry()
+        if widget is None:
+            return "break"
+        try:
+            clip = self.root.clipboard_get()
+        except tk.TclError:
+            return "break"
+        try:
+            widget.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        widget.insert("insert", clip)
+        return "break"
+
+    def _on_copy(self, _event: tk.Event | None = None) -> str:
+        widget = self._focused_entry()
+        if widget is None:
+            return "break"
+        try:
+            selected = widget.selection_get()
+        except tk.TclError:
+            return "break"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(selected)
+        self.root.update_idletasks()
+        return "break"
+
+    def _on_select_all(self, _event: tk.Event | None = None) -> str:
+        widget = self._focused_entry()
+        if widget is None:
+            return "break"
+        widget.select_range(0, tk.END)
+        widget.icursor(tk.END)
+        return "break"
+
+    def _bind_clipboard_shortcuts(self) -> None:
+        """Handle Cmd+V/C/A in Python so macOS Tk does not double-paste."""
+        bindings = (
+            ("<Command-v>", self._on_paste),
+            ("<Command-V>", self._on_paste),
+            ("<Command-c>", self._on_copy),
+            ("<Command-C>", self._on_copy),
+            ("<Command-a>", self._on_select_all),
+            ("<Command-A>", self._on_select_all),
+        )
+        targets = (self.root, self.api_key_entry, self.max_record_entry)
+        for sequence, handler in bindings:
+            for widget in targets:
+                widget.bind(sequence, handler)
 
     def _save(self) -> None:
         ENV_FILE.touch(exist_ok=True)
