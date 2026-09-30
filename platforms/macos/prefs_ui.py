@@ -29,10 +29,11 @@ class PreferencesApp:
         self.root = root
         self.root.title("Vibe Daemon Preferences")
         self.root.resizable(False, False)
-        self.root.bind(
-            "<Command-v>",
-            lambda e: self.root.focus_get().event_generate("<<Paste>>"),
-        )
+        def _handle_paste(event):
+            self.root.focus_get().event_generate("<<Paste>>")
+            return "break"
+
+        self.root.bind("<Command-v>", _handle_paste)
         self.root.bind(
             "<Command-c>",
             lambda e: self.root.focus_get().event_generate("<<Copy>>"),
