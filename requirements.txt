@@ -8,3 +8,4 @@ pynput
 sounddevice
 numpy
 google-antigravity
+flask

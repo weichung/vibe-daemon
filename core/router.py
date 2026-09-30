@@ -112,40 +112,23 @@ class VibeRouter:
             self.on_conversation(response_text)
         return response_text
 
-    def dispatch_audio(self, wav_bytes: bytes) -> str:
-        """Classify spoken audio and execute the matching tool. Returns a summary."""
-        if not self.client:
-            return "API key is missing. Please set it in Preferences."
-        self._pending_wav_bytes = wav_bytes
-        audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
-        try:
-            response = self.client.models.generate_content(
-                model=ROUTER_MODEL,
-                contents=[
-                    "Listen to this audio and call the appropriate tool.",
-                    audio_part,
-                ],
-                config=types.GenerateContentConfig(
-                    system_instruction=ROUTER_SYSTEM_INSTRUCTION,
-                    tools=[
-                        self._tool_route_to_ide,
-                        self._tool_execute_shell,
-                        self._tool_conversation,
-                    ],
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
-                    ),
-                    tool_config=types.ToolConfig(
-                        function_calling_config=types.FunctionCallingConfig(
-                            mode="ANY"
-                        )
-                    ),
-                ),
-            )
-        except Exception:
-            logger.exception("Gemini routing request failed")
-            return "Routing failed."
+    def _routing_config(self) -> types.GenerateContentConfig:
+        return types.GenerateContentConfig(
+            system_instruction=ROUTER_SYSTEM_INSTRUCTION,
+            tools=[
+                self._tool_route_to_ide,
+                self._tool_execute_shell,
+                self._tool_conversation,
+            ],
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="ANY")
+            ),
+        )
 
+    def _execute_function_calls(self, response) -> str:
         calls = response.function_calls or []
         if not calls:
             fallback = (response.text or "").strip()
@@ -176,3 +159,38 @@ class VibeRouter:
                 continue
             summaries.append(str(result).strip() or name)
         return "; ".join(summaries)
+
+    def dispatch_audio(self, wav_bytes: bytes) -> str:
+        """Classify spoken audio and execute the matching tool. Returns a summary."""
+        if not self.client:
+            return "API key is missing. Please set it in Preferences."
+        self._pending_wav_bytes = wav_bytes
+        audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
+        try:
+            response = self.client.models.generate_content(
+                model=ROUTER_MODEL,
+                contents=[
+                    "Listen to this audio and call the appropriate tool.",
+                    audio_part,
+                ],
+                config=self._routing_config(),
+            )
+        except Exception:
+            logger.exception("Gemini routing request failed")
+            return "Routing failed."
+        return self._execute_function_calls(response)
+
+    def dispatch_text(self, text: str) -> str:
+        """Classify a text command and execute the matching tool. Returns a summary."""
+        if not self.client:
+            return "API key is missing. Please set it in Preferences."
+        try:
+            response = self.client.models.generate_content(
+                model=ROUTER_MODEL,
+                contents=[text],
+                config=self._routing_config(),
+            )
+        except Exception:
+            logger.exception("Gemini text routing request failed")
+            return "Routing failed."
+        return self._execute_function_calls(response)

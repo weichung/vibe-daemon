@@ -21,6 +21,7 @@ from google import antigravity as ag
 from pynput import keyboard
 from pynput.keyboard import Key
 
+from core.api_server import start_server
 from core.parser import _extract_transcript, _extract_tts_summary
 from core.router import VibeRouter
 
@@ -221,6 +222,7 @@ class VibeDaemon:
         self.router.on_route_to_ide = self._on_route_to_ide
         self.router.on_shell_executed = self._on_router_text
         self.router.on_conversation = self._on_router_text
+        threading.Thread(target=start_server, args=(self.router,), daemon=True).start()
 
     def _on_route_to_ide(self, audio_bytes: bytes) -> None:
         """Forward routed coding audio to the existing Antigravity pipeline."""

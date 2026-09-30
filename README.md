@@ -30,6 +30,36 @@ The engine never stores API keys in source. Keys live in `~/.vibe_daemon_env` an
 - **Shell** — OS tasks → `subprocess` with stdout/stderr spoken and shown in the menu
 - **Conversation** — Q&A → bilingual TTS, matching the spoken language
 
+### Local Webhook API
+
+Vibe Daemon is primarily voice-driven, but at startup the engine also spawns a lightweight **Flask** HTTP server on port **50051** in a background daemon thread (`core/api_server.py`).
+
+That local webhook is the bridge for **external automation**: Python scripts, web scrapers, and multi-turn agentic loops can skip the microphone entirely and inject a text command straight into the same Gemini intent router used for speech (`dispatch_text`). The payload is classified as IDE / shell / conversation exactly as if you had spoken it.
+
+- **URL:** `POST http://127.0.0.1:50051/execute` (localhost only)
+- **Body:** `{"text": "<command>"}`
+- **Success:** `{"status": "success", "result": "<router summary>"}`
+
+The daemon must already be running (`python run_mac.py`). A missing API key returns the usual Preferences reminder in `result` instead of crashing.
+
+**Python (`requests`):**
+
+```python
+import requests
+
+payload = {"text": "Summarize the latest logs in my terminal."}
+response = requests.post("http://127.0.0.1:50051/execute", json=payload)
+print(response.json())
+```
+
+**cURL:**
+
+```bash
+curl -X POST http://127.0.0.1:50051/execute \
+     -H "Content-Type: application/json" \
+     -d '{"text": "Summarize the latest logs in my terminal."}'
+```
+
 ### Secure GUI dashboard
 
 Zero hardcoded keys. On first launch (or **Preferences…**), an isolated `tkinter` process opens **Vibe Daemon Preferences**:
@@ -138,7 +168,8 @@ pip install \
   pynput \
   sounddevice \
   numpy \
-  google-antigravity
+  google-antigravity \
+  flask
 ```
 
 `tkinter` ships with the conda Python.org / official macOS builds. If `import tkinter` fails: `conda install tk`.
@@ -152,6 +183,7 @@ pip install \
 | `sounddevice` | Microphone stream |
 | `numpy` | Audio buffers |
 | `google-antigravity` | IDE agent SDK |
+| `flask` | Local webhook API (`POST /execute`) |
 
 ## Usage
 
@@ -173,6 +205,8 @@ On first run, Preferences opens if no key is stored. Paste a [Gemini API key](ht
 | **Quit** | Engine shutdown |
 
 Hotkey debounce is 0.5 s. Conversational replies follow the user’s language (English or Traditional Chinese).
+
+Text-only automation (no microphone) is documented under [Local Webhook API](#local-webhook-api).
 
 Secrets stay in `~/.vibe_daemon_env` — never commit that file.
 
