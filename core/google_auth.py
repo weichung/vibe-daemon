@@ -76,7 +76,7 @@ def _run_installed_app_flow() -> Credentials:
             "Download credentials.json from Google Cloud Console into the project root."
         )
     flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
-    return flow.run_local_server(port=0)
+    return flow.run_local_server(port=0, host='127.0.0.1')
 
 
 def _save_token(creds: Credentials) -> None:
