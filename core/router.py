@@ -55,7 +55,22 @@ ROUTER_SYSTEM_INSTRUCTION = (
     "service_name='calendar', version='v3', method_path='events.list', "
     "kwargs={'calendarId': 'primary', 'maxResults': 10, 'singleEvents': True, "
     "'orderBy': 'startTime'}. Other service_name values: 'gmail' (v1), "
-    "'drive' (v3), 'docs' (v1), 'sheets' (v4), 'youtube' (v3)."
+    "'drive' (v3), 'docs' (v1), 'sheets' (v4), 'youtube' (v3). "
+    "GOOGLE API PARAMETER CHEAT SHEET: When calling "
+    "`_tool_google_workspace_api`, you MUST put these service-specific keys "
+    "in `kwargs`: "
+    "Calendar — always include \"calendarId\": \"primary\". When listing "
+    "events, also include \"timeMin\" and \"timeMax\" in RFC3339 format "
+    "(example: \"2026-10-02T00:00:00Z\"). "
+    "Gmail — always include \"userId\": \"me\". "
+    "YouTube — for list and search methods, always include \"part\" "
+    "(example: \"part\": \"snippet,contentDetails\"). "
+    "Drive — for files.list, specify \"spaces\": \"drive\". "
+    "Sheets — always include \"spreadsheetId\". "
+    "Docs — always include \"documentId\". "
+    "If the tool returns {\"status\": \"error\", ...}, read \"message\", "
+    "fix the missing parameter or invalid format in kwargs, and call "
+    "`_tool_google_workspace_api` again."
 )
 
 OnRouteToIde = Callable[[bytes], None]
@@ -192,11 +207,17 @@ class VibeRouter:
                 'v3' for drive/youtube, 'v4' for sheets.
             method_path: Resource chain in dot or call notation, e.g.
                 'events.list' or 'events().insert'.
-            kwargs: Keyword arguments for the final method, e.g.
-                {'calendarId': 'primary', 'maxResults': 10}.
+            kwargs: Keyword arguments for the final method. Required keys:
+                Calendar always needs calendarId='primary' plus timeMin and
+                timeMax (RFC3339) when listing events; Gmail always needs
+                userId='me'; YouTube list/search needs part (e.g.
+                'snippet,contentDetails'); Drive files.list needs
+                spaces='drive'; Sheets needs spreadsheetId; Docs needs
+                documentId.
 
         Returns:
-            JSON text of the API response, or a JSON error object.
+            JSON text of the API response, or a JSON error object the caller
+            can correct and retry.
         """
         logger.info(
             "Google Workspace API: %s %s %s",
@@ -216,14 +237,21 @@ class VibeRouter:
             _validate_google_target(service_name, version, method_path)
             creds = get_google_credentials()
             service = build(service_name, version, credentials=creds)
-            result = _execute_method_path(service, method_path, payload)
+            try:
+                result = _execute_method_path(service, method_path, payload)
+            except TypeError as exc:
+                logger.warning("Google API missing or invalid parameter: %s", exc)
+                return _google_tool_error(exc)
+            except HttpError as exc:
+                logger.warning("Google API HTTP error: %s", exc)
+                return _google_tool_error(exc)
             return json.dumps(result, default=str, ensure_ascii=False)
-        except HttpError as exc:
-            logger.exception("Google API HTTP error")
-            return json.dumps({"error": _http_error_detail(exc)})
+        except (TypeError, HttpError) as exc:
+            logger.warning("Google Workspace API error: %s", exc)
+            return _google_tool_error(exc)
         except Exception as exc:
             logger.exception("Google Workspace API call failed")
-            return json.dumps({"error": str(exc)})
+            return _google_tool_error(exc)
 
     def _routing_config(self) -> types.GenerateContentConfig:
         return types.GenerateContentConfig(
@@ -361,10 +389,19 @@ def _execute_method_path(service: object, method_path: str, kwargs: dict[str, An
     raise ValueError("method_path is empty")
 
 
-def _http_error_detail(exc: Exception) -> str:
-    content = getattr(exc, "content", None)
-    if isinstance(content, bytes):
-        return content.decode("utf-8", errors="replace")
-    if content:
-        return str(content)
-    return str(exc)
+_GOOGLE_RETRY_SUGGESTION = (
+    "Analyze the missing parameter or invalid format, update your kwargs, "
+    "and call this tool again."
+)
+
+
+def _google_tool_error(exc: BaseException) -> str:
+    """Return a non-fatal JSON error the model can correct on the next call."""
+    return json.dumps(
+        {
+            "status": "error",
+            "message": str(exc),
+            "suggestion": _GOOGLE_RETRY_SUGGESTION,
+        },
+        ensure_ascii=False,
+    )
