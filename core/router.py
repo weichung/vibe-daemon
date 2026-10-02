@@ -25,9 +25,12 @@ _SAFE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
 _MAX_METHOD_DEPTH = 8
 
 ROUTER_MODEL = "gemini-3.8-flash"
+MAX_TURNS = 3
 ROUTER_SYSTEM_INSTRUCTION = (
     "You are a macOS system router with a two-tier execution policy. "
-    "Listen to the audio (or read the text) and call exactly one appropriate tool. "
+    "Listen to the audio (or read the text). On each turn, call one appropriate "
+    "tool, or reply in natural language with no function call once the task is "
+    "finished. After a tool result, you may call a tool again to correct an error. "
     "For coding, extract the instruction. For OS tasks, write the correct "
     "bash/zsh command. For general chat, provide a concise response. Always "
     "reply to conversational queries in the exact same language that the user "
@@ -254,6 +257,8 @@ class VibeRouter:
             return _google_tool_error(exc)
 
     def _routing_config(self) -> types.GenerateContentConfig:
+        # AUTO lets a later turn answer in text. ANY would force a tool call
+        # on every turn, so the model could never finish the loop.
         return types.GenerateContentConfig(
             system_instruction=ROUTER_SYSTEM_INSTRUCTION,
             tools=self.tools,
@@ -261,72 +266,147 @@ class VibeRouter:
                 disable=True
             ),
             tool_config=types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(mode="ANY")
+                function_calling_config=types.FunctionCallingConfig(mode="AUTO")
             ),
         )
 
-    def _execute_function_calls(self, response) -> str:
-        calls = response.function_calls or []
-        if not calls:
-            fallback = (response.text or "").strip()
-            logger.warning("Router returned no function call; text=%s", fallback)
-            if fallback and self.on_conversation is not None:
-                self.on_conversation(fallback)
-            return fallback or "No route selected."
+    def _execute_function_calls(self, response) -> tuple[list[types.Part], str, bool]:
+        """Run each function call and build user-role function-response parts.
 
+        Returns the parts to append, a joined summary, and whether
+        ``_tool_conversation`` already spoke to the user.
+        """
+        calls = response.function_calls or []
         tools = {tool.__name__: tool for tool in self.tools}
+        parts: list[types.Part] = []
         summaries: list[str] = []
+        conversation_spoken = False
         for call in calls:
             name = call.name or ""
             args = dict(call.args or {})
             logger.info("Router function call: %s(%s)", name, args)
             tool = tools.get(name)
             if tool is None:
-                summaries.append(f"Unknown tool: {name}")
-                continue
+                result = f"Unknown tool: {name}"
+            else:
+                try:
+                    result = str(tool(**args))
+                except Exception as exc:
+                    logger.exception("Tool %s failed", name)
+                    result = json.dumps(
+                        {
+                            "status": "error",
+                            "message": str(exc),
+                            "suggestion": (
+                                "Analyze the error, adjust the arguments, "
+                                "and call the tool again."
+                            ),
+                        }
+                    )
+            if name == "_tool_conversation":
+                conversation_spoken = True
+            summaries.append(result.strip() or name)
+            part = types.Part.from_function_response(
+                name=name,
+                response=_function_response_body(result),
+            )
+            call_id = getattr(call, "id", None)
+            if call_id and part.function_response is not None:
+                part.function_response.id = call_id
+            parts.append(part)
+        return parts, "; ".join(summaries), conversation_spoken
+
+    def _agent_loop(self, contents: list[types.Content]) -> str:
+        """Send history to Gemini until it answers in text or the turn cap hits."""
+        last_summary = ""
+        conversation_spoken = False
+        for turn in range(1, MAX_TURNS + 1):
+            logger.info("Router turn %d/%d", turn, MAX_TURNS)
             try:
-                result = tool(**args)
+                response = self.client.models.generate_content(
+                    model=ROUTER_MODEL,
+                    contents=contents,
+                    config=self._routing_config(),
+                )
             except Exception:
-                logger.exception("Tool %s failed", name)
-                summaries.append(f"{name} failed")
-                continue
-            summaries.append(str(result).strip() or name)
-        return "; ".join(summaries)
+                logger.exception("Gemini routing request failed")
+                return last_summary or "Routing failed."
+
+            calls = response.function_calls or []
+            if not calls:
+                text = (response.text or "").strip()
+                if not text:
+                    return last_summary or "No route selected."
+                if not conversation_spoken and self.on_conversation is not None:
+                    self.on_conversation(text)
+                return text
+
+            model_content = _model_content(response)
+            if model_content is None:
+                logger.warning("Function call missing model content; stopping loop")
+                _parts, summary, _spoken = self._execute_function_calls(response)
+                return summary or last_summary or "No route selected."
+
+            contents.append(model_content)
+            parts, summary, spoke = self._execute_function_calls(response)
+            last_summary = summary or last_summary
+            conversation_spoken = conversation_spoken or spoke
+            if not parts:
+                return last_summary or "No route selected."
+            contents.append(types.Content(role="user", parts=parts))
+
+        logger.warning("Router reached MAX_TURNS=%d", MAX_TURNS)
+        return last_summary or "No route selected."
 
     def dispatch_audio(self, wav_bytes: bytes) -> str:
-        """Classify spoken audio and execute the matching tool. Returns a summary."""
+        """Classify spoken audio, run tools, and let the model repair errors."""
         if not self.client:
             return "API key is missing. Please set it in Preferences."
         self._pending_wav_bytes = wav_bytes
         audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
-        try:
-            response = self.client.models.generate_content(
-                model=ROUTER_MODEL,
-                contents=[
-                    "Listen to this audio and call the appropriate tool.",
+        contents = [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text="Listen to this audio and call the appropriate tool."
+                    ),
                     audio_part,
                 ],
-                config=self._routing_config(),
             )
-        except Exception:
-            logger.exception("Gemini routing request failed")
-            return "Routing failed."
-        return self._execute_function_calls(response)
+        ]
+        return self._agent_loop(contents)
 
     def dispatch_text(self, text: str) -> str:
-        """Classify a text command and execute the matching tool. Returns a summary."""
+        """Classify a text command, run tools, and let the model repair errors."""
         if not self.client:
             return "API key is missing. Please set it in Preferences."
-        try:
-            response = self.client.models.generate_content(
-                model=ROUTER_MODEL,
-                contents=[text],
-                config=self._routing_config(),
-            )
-        except Exception:
-            logger.exception("Gemini text routing request failed")
-            return "Routing failed."
-        return self._execute_function_calls(response)
+        contents = [
+            types.Content(role="user", parts=[types.Part.from_text(text=text)])
+        ]
+        return self._agent_loop(contents)
+
+
+def _model_content(response) -> types.Content | None:
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates or candidates[0].content is None:
+        return None
+    content = candidates[0].content
+    if not getattr(content, "role", None):
+        content.role = "model"
+    return content
+
+
+def _function_response_body(result: str) -> dict[str, Any]:
+    """Turn a tool string into the JSON object FunctionResponse requires."""
+    text = "" if result is None else str(result)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {"output": text}
+    if isinstance(parsed, dict):
+        return parsed
+    return {"output": parsed}
 
 
 def _normalize_kwargs(kwargs: object) -> dict[str, Any]:
