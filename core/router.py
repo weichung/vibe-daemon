@@ -23,6 +23,18 @@ _ALLOWED_GOOGLE_SERVICES = frozenset(
 _SAFE_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SAFE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
 _MAX_METHOD_DEPTH = 8
+WORKSPACE_DIR = os.path.expanduser("~/vibe_workspace")
+HOME_DIR = os.path.expanduser("~")
+SHELL_TIMEOUT_SECONDS = 15
+_SHELL_BLOCKLIST = (
+    "sudo ",
+    "rm -rf /",
+    "mkfs",
+    "> ~/.bashrc",
+)
+_SHELL_BLOCKED_MESSAGE = (
+    "Command blocked for safety reasons. Do not use sudo or destructive commands."
+)
 
 ROUTER_MODEL = "gemini-3.8-flash"
 MAX_TURNS = 3
@@ -73,7 +85,12 @@ ROUTER_SYSTEM_INSTRUCTION = (
     "Docs — always include \"documentId\". "
     "If the tool returns {\"status\": \"error\", ...}, read \"message\", "
     "fix the missing parameter or invalid format in kwargs, and call "
-    "`_tool_google_workspace_api` again."
+    "`_tool_google_workspace_api` again. "
+    "When using `_tool_execute_shell`, you are running in a macOS sandbox. "
+    "You can read any file and execute applications, but you are ONLY allowed "
+    "to write/modify files inside `~/vibe_workspace`. Any attempt to write "
+    "outside this directory will be blocked by the OS. Keep commands under "
+    "15 seconds."
 )
 
 OnRouteToIde = Callable[[bytes], None]
@@ -89,6 +106,7 @@ class VibeRouter:
         self.on_shell_executed: Optional[OnText] = None
         self.on_conversation: Optional[OnText] = None
         self._pending_wav_bytes: bytes = b""
+        os.makedirs(WORKSPACE_DIR, exist_ok=True)
         self.tools = [
             self._tool_route_to_ide,
             self._tool_execute_shell,
@@ -131,24 +149,46 @@ class VibeRouter:
         return f"Routed to IDE: {instruction}"
 
     def _tool_execute_shell(self, command: str) -> str:
-        """Run an OS-level bash/zsh command on this Mac.
+        """Run a bash command under a macOS Seatbelt profile.
 
-        Use this for OS-level tasks such as opening apps, listing files,
-        checking system status, or running shell commands.
+        Use this for OS-level tasks such as listing files or running shell
+        commands. You can read any file and execute applications, but writes
+        are allowed only inside ~/vibe_workspace. Commands time out after 15
+        seconds. Do not use sudo or destructive system commands.
 
         Args:
-            command: A complete bash/zsh command to execute.
+            command: A complete bash command. It runs via sandbox-exec.
 
         Returns:
-            Combined stdout and stderr from the command.
+            Combined stdout and stderr, or a JSON error if the command is
+            blocked or times out.
         """
-        logger.info("Execute shell: %s", command)
-        completed = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
+        logger.info("Execute shell in %s: %s", WORKSPACE_DIR, command)
+        if _shell_command_blocked(command):
+            logger.warning("Blocked shell command: %s", command)
+            return _shell_tool_error(
+                _SHELL_BLOCKED_MESSAGE,
+                "Choose a non-destructive command. Writes must stay inside ~/vibe_workspace.",
+            )
+        profile = _seatbelt_profile()
+        try:
+            completed = subprocess.run(
+                ["sandbox-exec", "-p", profile, "/bin/bash", "-c", command],
+                capture_output=True,
+                text=True,
+                cwd=WORKSPACE_DIR,
+                timeout=SHELL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Shell command timed out after %ss: %s",
+                SHELL_TIMEOUT_SECONDS,
+                command,
+            )
+            return _shell_tool_error(
+                f"Command timed out after {SHELL_TIMEOUT_SECONDS} seconds.",
+                "Run a faster command, or split the work into a smaller step.",
+            )
         result = ((completed.stdout or "") + (completed.stderr or "")).strip()
         if not result:
             result = f"Command exited with status {completed.returncode}."
@@ -385,6 +425,30 @@ class VibeRouter:
             types.Content(role="user", parts=[types.Part.from_text(text=text)])
         ]
         return self._agent_loop(contents)
+
+
+def _seatbelt_profile() -> str:
+    """Allow reads and exec, but deny home-directory writes outside the workspace."""
+    home = HOME_DIR.replace("\\", "\\\\").replace('"', '\\"')
+    workspace = WORKSPACE_DIR.replace("\\", "\\\\").replace('"', '\\"')
+    return (
+        "(version 1)\n"
+        "(allow default)\n"
+        f'(deny file-write* (subpath "{home}"))\n'
+        f'(allow file-write* (subpath "{workspace}"))\n'
+    )
+
+
+def _shell_command_blocked(command: str) -> bool:
+    lowered = command.lower()
+    return any(keyword in lowered for keyword in _SHELL_BLOCKLIST)
+
+
+def _shell_tool_error(message: str, suggestion: str) -> str:
+    return json.dumps(
+        {"status": "error", "message": message, "suggestion": suggestion},
+        ensure_ascii=False,
+    )
 
 
 def _model_content(response) -> types.Content | None:

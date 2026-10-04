@@ -24,11 +24,27 @@ The engine never stores API keys in source. Keys live in `~/.vibe_daemon_env` an
 
 ### Intelligent routing
 
-`core/router.py` sends the WAV clip to **Gemini 3.8 Flash** with three tools. Automatic function calling is disabled; the daemon parses `function_calls` and runs the matching Python method:
+`core/router.py` sends the WAV clip to **Gemini 3.8 Flash**. Automatic function calling is disabled; the daemon parses `function_calls` and runs the matching Python method:
 
 - **IDE** — coding / file edits → Antigravity agent (`<tts>` summary + `<transcript>`)
 - **Shell** — OS tasks → `subprocess` with stdout/stderr spoken and shown in the menu
 - **Conversation** — Q&A → bilingual TTS, matching the spoken language
+- **Google Workspace** — Calendar, Gmail, Drive, Docs, Sheets, and YouTube via one API tool
+- **Computer use** — GUI fallback (placeholder until the slow path is implemented)
+
+### Autonomous multi-turn agent (ReAct loop)
+
+`dispatch_audio` and `dispatch_text` no longer stop after a single tool call. The router keeps the conversation history and loops for up to **`MAX_TURNS` (3)** Gemini turns.
+
+When a tool returns an error — for example a missing Google API parameter — that result is sent back as a function response (`types.Part.from_function_response`). The model reads the message, fixes the arguments, and calls the tool again. The loop ends when the model replies in natural language, or when the turn cap is reached.
+
+### Google Workspace integration
+
+Calendar, Gmail, Drive, Docs, Sheets, and YouTube share one Fast Path tool, `_tool_google_workspace_api`. The model passes `service_name`, `version`, `method_path`, and `kwargs`; the router builds the matching Google API client and calls it.
+
+Sign-in is local OAuth. Client secrets come from `credentials.json` in the project root (`core/google_auth.py`). The user token is stored at `~/.vibe_daemon_token.json` and refreshed when it expires. The first login opens a browser via `InstalledAppFlow.run_local_server`.
+
+If a required parameter is missing or the API returns an error, the tool does not crash the daemon. It returns a JSON object (`status`, `message`, `suggestion`) that the ReAct loop feeds back so the model can correct `kwargs` on the next turn.
 
 ### Local Webhook API
 
@@ -134,7 +150,8 @@ vibe-daemon/
 ├── daemon.py                       # Alias → run_mac.py
 ├── core/
 │   ├── engine.py                   # State machine, hotkey, VAD, git, callbacks
-│   ├── router.py                   # Gemini 3.8 Flash function calling
+│   ├── router.py                   # Gemini 3.8 Flash function calling, MAX_TURNS loop
+│   ├── google_auth.py              # Google Workspace OAuth (credentials.json)
 │   ├── api_server.py               # Flask webhook on 127.0.0.1:50051
 │   ├── todo_watcher.py             # ~/Documents/VibeTasks.md poller
 │   └── parser.py                   # <tts> / <transcript> extraction
@@ -149,7 +166,8 @@ vibe-daemon/
 | --- | --- |
 | `run_mac.py` | `threading.Thread(target=engine.run, daemon=True)` then `rumps.App.run()` on the main thread. |
 | `core/engine.py` | `IDLE → RECORDING → PROCESSING`, Cmd+Shift+Space toggle, RMS VAD, git checkpoint, webhook + TODO watcher threads. |
-| `core/router.py` | `genai.Client` (safe init), `dispatch_audio` / `dispatch_text`, tools for IDE / shell / chat. |
+| `core/router.py` | `genai.Client` (safe init), `dispatch_audio` / `dispatch_text`, multi-turn tool loop, IDE / shell / chat / Google Workspace. |
+| `core/google_auth.py` | Load `credentials.json`, store `~/.vibe_daemon_token.json`, refresh Calendar, Gmail, Drive, Docs, Sheets, and YouTube scopes. |
 | `core/api_server.py` | Local Flask `POST /execute` for microphone-free injection. |
 | `core/todo_watcher.py` | Poll `VibeTasks.md`, dispatch unfinished tasks, mark done with a disk re-read. |
 | `platforms/macos/menu_app.py` | Callbacks only: TTS, menu titles, Open TODO List, launches `prefs_ui.py` as a child process. |
@@ -239,18 +257,21 @@ Secrets stay in `~/.vibe_daemon_env` — never commit that file.
 
 ## Roadmap
 
-### Phase 2: Autonomous multi-turn agent (ReAct loop)
-
-Upgrade `core/router.py` from **single-shot** tool calls to a **stateful, multi-turn reasoning loop**. The agent should observe results, plan the next step, and continue until the goal is met — including tasks with sequential dependencies (search → read → edit → verify) that one Gemini turn cannot finish safely.
-
 ### Expanded agentic pipelines
 
 Build dedicated external Python scripts that talk to the **Local Webhook API** (`127.0.0.1:50051`) to automate daily workflows without the microphone: download harvesters, log summarizers, and code reviewers that POST text commands into the same Gemini router the hotkey uses.
 
+### Phase 3: OS-level sandbox safety
+
+Wrap `_tool_execute_shell` with macOS **`sandbox-exec`** (Seatbelt). The profile should allow reads and normal execution, but deny writes outside **`~/vibe_workspace`**, so a mistaken command cannot delete or overwrite the rest of the home directory.
+
+### Phase 4: Computer Use (slow path)
+
+GUI automation and browser control for tasks that have no CLI or API. Drive clicks, forms, and page navigation through **Playwright** or **Anthropic** computer use, behind the existing `_tool_computer_use` fallback.
+
 ### Later
 
 - **PyInstaller `.app` + GitHub Actions** — signed menu-bar bundle, CI install/test/release, no Terminal required.
-- **Vision & screen capture** — multimodal context (screenshot + voice) for UI bugs and design diffs.
 
 ## License
 
